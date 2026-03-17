@@ -1,15 +1,28 @@
-
 import { Kafka } from 'kafkajs';
 import Redis from 'ioredis';
+import { InfluxDB, Point } from '@influxdata/influxdb-client';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
+//  Initialize Redis
 const redis = new Redis({
     host: process.env.REDIS_HOST,
     port: process.env.REDIS_PORT,
 });
 
+//  Initialize InfluxDB
+const influxDB = new InfluxDB({
+    url: process.env.INFLUXDB_URL,
+    token: process.env.INFLUXDB_TOKEN
+});
+const writeApi = influxDB.getWriteApi(
+    process.env.INFLUXDB_ORG,
+    process.env.INFLUXDB_BUCKET
+);
+writeApi.useDefaultTags({ app: 'analytics' });
+
+// Initialize Kafka
 const kafka = new Kafka({
     clientId: 'stream-processor',
     brokers: [process.env.BROKER_URL],
@@ -37,11 +50,22 @@ async function run() {
                 const event = JSON.parse(message.value.toString());
                 console.log('Processing event:', event.type);
 
+                //  REDIS LOGIC
                 const windowKey = getWindowKey(event.type);
-                await redis.hincrby(windowKey, 'count', 1); //hincrby is atomic
-
-                //In Redis, ZADD is the command used to add members to a Sorted Set
+                await redis.hincrby(windowKey, 'count', 1);
                 await redis.zadd('events:timeline', Date.now(), message.value.toString());
+
+                // INFLUXDB LOGIC
+                const point = new Point('raw_event')
+                    .tag('type', event.type)
+                    .tag('userId', event.userId || 'anonymous')
+                    .intField('value', 1)
+                    .timestamp(new Date());
+
+                writeApi.writePoint(point);
+
+                // Flush sends the data to the InfluxDB server
+                await writeApi.flush();
 
             } catch (err) {
                 console.error('Error processing message:', err);
@@ -49,5 +73,10 @@ async function run() {
         },
     });
 }
+
+process.on('SIGINT', async () => {
+    await writeApi.close();
+    process.exit(0);
+});
 
 run().catch(console.error);
